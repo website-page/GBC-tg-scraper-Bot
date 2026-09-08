@@ -4,7 +4,14 @@ from flask import Flask, jsonify, request
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import InviteToChannelRequest
-from telethon.errors import FloodWaitError, UserPrivacyRestrictedError, UserAlreadyParticipantError, ChatAdminRequiredError, UserNotMutualContactError
+from telethon.errors import (
+    FloodWaitError,
+    UserPrivacyRestrictedError,
+    UserAlreadyParticipantError,
+    UserNotParticipantError,
+    ChatAdminRequiredError,
+    UserNotMutualContactError,
+)
 
 app = Flask(__name__)
 
@@ -19,6 +26,17 @@ MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "")
 
 def parse_ids(value):
     return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+async def is_already_in_target(client, target, user_id):
+    try:
+        await client.get_permissions(target, user_id)
+        return True
+    except UserNotParticipantError:
+        return False
+    except Exception:
+        # If Telegram cannot verify membership, leave the user for a later run.
+        return False
 
 
 async def migrate_consented_users():
@@ -36,15 +54,22 @@ async def migrate_consented_users():
         target = await client.get_entity(TARGET_CHANNEL)
         processed = []
         failed = []
+        already_joined = []
 
-        # Process only the first small batch of explicitly consented IDs.
-        # The scheduler should invoke this endpoint again for the next batch.
-        for user_id in user_ids[:BATCH_SIZE]:
+        # Each run selects the next users who are not already in the target.
+        for user_id in user_ids:
+            if len(processed) >= BATCH_SIZE:
+                break
+
+            if await is_already_in_target(client, target, user_id):
+                already_joined.append(user_id)
+                continue
+
             try:
                 await client(InviteToChannelRequest(target, [user_id]))
                 processed.append(user_id)
             except UserAlreadyParticipantError:
-                processed.append(user_id)
+                already_joined.append(user_id)
             except (UserPrivacyRestrictedError, UserNotMutualContactError) as exc:
                 failed.append({"user_id": user_id, "error": type(exc).__name__})
             except FloodWaitError as exc:
@@ -58,10 +83,13 @@ async def migrate_consented_users():
 
             await asyncio.sleep(2)
 
+        remaining = max(0, len(user_ids) - len(processed) - len(already_joined) - len(failed))
         return {
             "ok": True,
             "processed": processed,
+            "already_joined": already_joined,
             "failed": failed,
+            "remaining_estimate": remaining,
             "batch_size": BATCH_SIZE,
             "note": "Only explicitly consented user IDs are processed. Telegram privacy and permission rules still apply."
         }
