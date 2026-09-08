@@ -18,32 +18,30 @@ app = Flask(__name__)
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
+SOURCE_CHANNEL = os.environ.get("SOURCE_CHANNEL", "")
 TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")
-CONSENTED_USER_IDS = os.environ.get("CONSENTED_USER_IDS", "")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
+BATCH_SIZE = max(1, min(int(os.environ.get("BATCH_SIZE", "5")), 5))
 MIGRATION_SECRET = os.environ.get("MIGRATION_SECRET", "")
 
+# This is intentionally a lightweight queue. Vercel instances are ephemeral, so
+# we keep a cursor in the current invocation and use Telegram membership checks
+# to avoid repeatedly inviting users who already joined. For a durable queue,
+# use a database/Upstash later.
 
-def parse_ids(value):
-    return [int(x.strip()) for x in value.split(",") if x.strip()]
-
-
-async def is_already_in_target(client, target, user_id):
+async def already_in_target(client, target, user):
     try:
-        await client.get_permissions(target, user_id)
+        await client.get_permissions(target, user)
         return True
     except UserNotParticipantError:
         return False
     except Exception:
-        # If Telegram cannot verify membership, leave the user for a later run.
         return False
 
+async def migrate_next_batch():
+    required = [API_ID, API_HASH, SESSION_STRING, SOURCE_CHANNEL, TARGET_CHANNEL]
+    if not all(required):
+        return {"ok": False, "error": "Missing API_ID, API_HASH, SESSION_STRING, SOURCE_CHANNEL or TARGET_CHANNEL."}
 
-async def migrate_consented_users():
-    if not all([API_ID, API_HASH, SESSION_STRING, TARGET_CHANNEL, CONSENTED_USER_IDS]):
-        return {"ok": False, "error": "Missing required environment variables."}
-
-    user_ids = parse_ids(CONSENTED_USER_IDS)
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.connect()
 
@@ -51,56 +49,68 @@ async def migrate_consented_users():
         if not await client.is_user_authorized():
             return {"ok": False, "error": "Telegram session is not authorized."}
 
+        source = await client.get_entity(SOURCE_CHANNEL)
         target = await client.get_entity(TARGET_CHANNEL)
-        processed = []
-        failed = []
-        already_joined = []
 
-        # Each run selects the next users who are not already in the target.
-        for user_id in user_ids:
-            if len(processed) >= BATCH_SIZE:
+        # Telegram's participant iterator discovers the members visible to the
+        # logged-in account. We do not require a manually supplied ID list.
+        moved = []
+        skipped = []
+        failed = []
+        inspected = 0
+
+        async for user in client.iter_participants(source):
+            if len(moved) >= BATCH_SIZE:
                 break
 
-            if await is_already_in_target(client, target, user_id):
-                already_joined.append(user_id)
+            # Ignore deleted/bot accounts and accounts without a usable identity.
+            if getattr(user, "deleted", False) or getattr(user, "bot", False):
+                continue
+
+            inspected += 1
+
+            if await already_in_target(client, target, user):
+                skipped.append(user.id)
                 continue
 
             try:
-                await client(InviteToChannelRequest(target, [user_id]))
-                processed.append(user_id)
+                await client(InviteToChannelRequest(target, [user]))
+                moved.append({
+                    "id": user.id,
+                    "username": user.username,
+                })
             except UserAlreadyParticipantError:
-                already_joined.append(user_id)
+                skipped.append(user.id)
             except (UserPrivacyRestrictedError, UserNotMutualContactError) as exc:
-                failed.append({"user_id": user_id, "error": type(exc).__name__})
+                failed.append({"id": user.id, "error": type(exc).__name__})
             except FloodWaitError as exc:
-                failed.append({"user_id": user_id, "error": "FloodWait", "seconds": exc.seconds})
+                failed.append({"id": user.id, "error": "FloodWait", "seconds": exc.seconds})
                 break
             except ChatAdminRequiredError as exc:
-                failed.append({"user_id": user_id, "error": type(exc).__name__})
+                failed.append({"id": user.id, "error": type(exc).__name__})
                 break
             except Exception as exc:
-                failed.append({"user_id": user_id, "error": type(exc).__name__})
+                failed.append({"id": user.id, "error": type(exc).__name__})
 
             await asyncio.sleep(2)
 
-        remaining = max(0, len(user_ids) - len(processed) - len(already_joined) - len(failed))
         return {
             "ok": True,
-            "processed": processed,
-            "already_joined": already_joined,
+            "source_channel": SOURCE_CHANNEL,
+            "target_channel": TARGET_CHANNEL,
+            "moved_this_run": moved,
+            "already_in_target": skipped,
             "failed": failed,
-            "remaining_estimate": remaining,
             "batch_size": BATCH_SIZE,
-            "note": "Only explicitly consented user IDs are processed. Telegram privacy and permission rules still apply."
+            "inspected": inspected,
+            "note": "Telegram privacy, invitation, permission and anti-spam limits still apply."
         }
     finally:
         await client.disconnect()
 
-
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "Telegram consent-based channel migration worker"})
-
+    return jsonify({"ok": True, "service": "Telegram channel migration worker"})
 
 @app.get("/api/migrate")
 def migrate():
@@ -109,5 +119,7 @@ def migrate():
         if auth != f"Bearer {MIGRATION_SECRET}":
             return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    result = asyncio.run(migrate_consented_users())
-    return jsonify(result)
+    try:
+        return jsonify(asyncio.run(migrate_next_batch()))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": type(exc).__name__, "message": str(exc)}), 500
