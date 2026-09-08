@@ -1,0 +1,23 @@
+name: Telegram migration scheduler
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger migration endpoint
+        env:
+          MIGRATION_URL: ${{ secrets.MIGRATION_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$MIGRATION_URL"
+          test -n "$CRON_SECRET"
+          curl --fail-with-body --silent --show-error \
+            --request GET \
+            --header "Authorization: Bearer $CRON_SECRET" \
+            "$MIGRATION_URL"
